@@ -109,6 +109,16 @@ function normalizeList(value) {
 }
 
 /** 写入一条线索，返回行 id。自动遗忘和手工 seed 都走这里。 */
+/** 删掉一条线索（surface 替换失败时用来补偿，避免留重复行）。 */
+export function deleteClue(db, id) {
+  if (!Number.isFinite(Number(id))) return
+  try {
+    db.prepare('DELETE FROM memory_clues WHERE id = ?').run(Number(id))
+  } catch {
+    /* 补偿失败就算了，别把主流程带崩 */
+  }
+}
+
 export function storeClue(db, clue) {
   const keywords = normalizeList(clue.keywords)
   const seedTokens = normalizeList(clue.seedTokens)
@@ -318,12 +328,25 @@ function spanIsBalanced(session, startIdx, endIdx) {
 }
 
 /** 找一个未闭合的 compaction/start：压缩正在进行时不要跟它抢 surface。 */
+/** 未闭合的 compaction/start 超过这么多事件之前，就当成已失效（崩溃残留）。 */
+const STALE_COMPACTION_EVENTS = 20
+
 function compactionActive(events) {
   let active = false
-  for (const event of events) {
-    if (event.type === 'compaction/start') active = true
-    else if (event.type === 'compaction/end') active = false
+  let startedAt = -1
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i]
+    if (event.type === 'compaction/start') {
+      active = true
+      startedAt = i
+    } else if (event.type === 'compaction/end') {
+      active = false
+      startedAt = -1
+    }
   }
+  // 崩溃留下的 unpaired start 会让 active 永远为真、这个会话再也不折。
+  // 真在进行的压缩，start 一定贴近事件末尾；离末尾太远就视为残留。
+  if (active && startedAt >= 0 && events.length - startedAt > STALE_COMPACTION_EVENTS) return false
   return active
 }
 
@@ -352,7 +375,9 @@ export function selectForgettableSpan(session, options, events = session.snapsho
     const t = turnMap.get(node)
     if (t !== undefined) surfaceTurns.add(t)
   }
-  const live = completed.filter((t) => surfaceTurns.has(t))
+  const liveAll = completed.filter((t) => surfaceTurns.has(t))
+  // 从第 skipTurns 个「还活着」的轮次开始选：旧区间不合格时可以往后退一段再试。
+  const live = liveAll.slice(Math.max(0, Number(options.skipTurns) || 0))
   const keep = Math.max(0, Number(options.keepCompletedTurns) || 0)
   const removable = Math.max(0, live.length - keep)
   if (removable < 1) return null
@@ -427,13 +452,20 @@ function measureTokens(ctx, session) {
     }
   }
   let chars = 0
-  for (const seq of session.surface.nodes) {
-    const message = session.deriveEventMessage?.(session.eventAt(seq))
-    for (const block of message?.content ?? []) {
-      if (block.type === 'text' && typeof block.text === 'string') chars += block.text.length
+  const collect = (blocks) => {
+    for (const block of blocks ?? []) {
+      if (typeof block?.text === 'string') chars += block.text.length
+      // 工具结果的正文藏在 content 里，别漏了（漏了会低估整轮体量）
+      if (Array.isArray(block?.content)) collect(block.content)
+      if (Array.isArray(block?.output)) collect(block.output)
     }
   }
-  return Math.ceil(chars / 3)
+  for (const seq of session.surface.nodes) {
+    const message = session.deriveEventMessage?.(session.eventAt(seq))
+    collect(message?.content)
+  }
+  // 中文约 0.6 token/字（原来按 /3 低估了约 1.8 倍）
+  return Math.ceil(chars * 0.6)
 }
 
 function buildForgetNotice(clue, turnCount) {
@@ -519,42 +551,71 @@ export function resolvePolicy(settings, sessionId) {
 }
 
 export function installForgettingHook(ctx, settings, connection) {
-  let lastCutTurn = -1
+  // 每个会话各自记「这一轮已经折了几次」。
+  // 旧实现是一个模块级 let lastCutTurn —— 两个会话轮次号相同时会互相挡住，
+  // 表现为「A 折完，B 到同一轮就再也不折」。这里按 agentId 分开。
+  const foldState = new Map() // agentId -> { turn, count }
+  const MAX_FOLD_PER_TURN = 3 // 一轮最多折几次，避免一步一刀把当前轮掏空
+  const MAX_SKIP = 3 // 最旧那段不合格时，最多往后退几段再试
+
+  const noticeOf = (state, agentId, turn) => {
+    if (state.turn !== turn) {
+      state.turn = turn
+      state.count = 0
+    }
+    foldState.set(agentId, state)
+  }
 
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
       const session = payload?.agent?.session
       if (session === undefined) return await next()
       if (payload.signal?.aborted === true) return await next()
-      // 同一轮只切一次，避免一步一刀把当前轮掏空。
-      if (payload.turn === lastCutTurn) return await next()
 
-      const policy = resolvePolicy(settings, payload?.agent?.id ?? session.id)
+      const agentId = String(payload.agent?.id ?? session.id ?? '')
+      const state = foldState.get(agentId) ?? { turn: -1, count: 0 }
+      noticeOf(state, agentId, payload.turn)
+      if (state.count >= MAX_FOLD_PER_TURN) return await next()
+
+      const policy = resolvePolicy(settings, agentId)
       const tokens = measureTokens(ctx, session)
       if (tokens < policy.forgetThresholdTokens) return await next()
 
       const events = session.snapshotEvents()
       if (compactionActive(events)) return await next()
 
-      const span = selectForgettableSpan(session, { ...policy, totalTokens: tokens }, events)
-      if (span === null) return await next()
-
-      const texts = []
-      for (const seq of span.shadowedSeqs) {
-        texts.push(messageText(session.deriveEventMessage?.(session.eventAt(seq))))
+      // 最旧那段可能「工具没配对」或者「提不出线索」，那就往后退一段再试，
+      // 而不是直接放弃 —— 否则这个会话会永远卡在同一个不合格区间上。
+      let span = null
+      let clue = null
+      for (let skip = 0; skip <= MAX_SKIP; skip += 1) {
+        const candidate = selectForgettableSpan(
+          session,
+          { ...policy, totalTokens: tokens, skipTurns: skip },
+          events,
+        )
+        if (candidate === null) continue
+        const texts = []
+        for (const seq of candidate.shadowedSeqs) {
+          texts.push(messageText(session.deriveEventMessage?.(session.eventAt(seq))))
+        }
+        const parsed = extractClue(texts.filter((text) => text.trim() !== ''))
+        if (parsed.seedTokens.length === 0) continue
+        span = candidate
+        clue = parsed
+        break
       }
-      const clue = extractClue(texts.filter((text) => text.trim() !== ''))
-      if (clue.seedTokens.length === 0) return await next()
+      if (span === null || clue === null) return await next()
 
       // 先落库：这一步失败就不开 compaction 事务，surface 保持原样。
-      storeClue(connection(), {
-        sessionId: String(payload.agent?.id ?? session.id ?? ''),
+      const clueId = storeClue(connection(), {
+        sessionId: agentId,
         keywords: clue.keywords,
         seedTokens: clue.seedTokens,
         summary: clue.summary,
       })
 
-      // 走 DSH 自己的 compaction 词汇：Chat 会把这一段渲染成一行“记忆已折叠”，
+      // 走 DSH 自己的 compaction 词汇：Chat 会把这一段渲染成一行「记忆已折叠」，
       // 模型则只看到被替换进去的那条 checkpoint 消息。
       const compactionId = randomUUID()
       const notice = buildForgetNotice(clue, span.turns.length)
@@ -566,25 +627,30 @@ export function installForgettingHook(ctx, settings, connection) {
           shadowedRange: { start: span.startSeq, end: span.endSeq },
           shadowedSeqs: span.shadowedSeqs,
           shadowedTokenCount: shadowedTokens(ctx, session, span.shadowedSeqs),
-          provider: 'full-life-memory',
+          provider: 'life-memory',
           model: 'clue-rules',
         })
         session.append('user/message', createNoticeMessage(notice, compactionId), {
           surfaceOp: { op: 'replace', startSeq: span.startSeq, endSeq: span.endSeq },
           sourceEventSeqs: span.shadowedSeqs,
         })
+      } catch (error) {
+        // 历史没换成，但线索已经落库了 —— 撤掉，否则下次重试会留重复行。
+        deleteClue(connection(), clueId)
+        throw error
       } finally {
         // 无论替换是否成功都闭合事务，避免留下会锁住真实 compaction 的 unpaired start。
         session.append('compaction/end', { compactionId, turn: payload.turn })
       }
 
-      lastCutTurn = payload.turn
+      state.count += 1
+      foldState.set(agentId, state)
       ctx.logger?.info?.(
-        `full-life-memory: folded ${span.turns.length} turn(s) (~${tokens} tokens) ` +
+        `life-memory: folded ${span.turns.length} turn(s) (~${tokens} tokens) ` +
         `from surface seq ${span.startSeq}..${span.endSeq} as compaction ${compactionId}; clues: ${clue.keywords.join(', ')}`,
       )
     } catch (error) {
-      ctx.logger?.warn?.(`full-life-memory: forget skipped: ${error instanceof Error ? error.message : String(error)}`)
+      ctx.logger?.warn?.(`life-memory: forget skipped: ${error instanceof Error ? error.message : String(error)}`)
     }
     return await next()
   })
