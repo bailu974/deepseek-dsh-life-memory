@@ -130,7 +130,7 @@ dsh plugin --profile desktop add https://github.com/bailu974/deepseek-dsh-life-m
 ## 开发
 
 ```bash
-node --test     # 5 个测试：一次砍到位 / 折完还能再折 / 保留轮次 / 工具配对 / 边界
+node --test     # 12 个测试：区间选择 / 会话策略 / 跨会话隔离 / 陈旧 compaction / 换段重试
 ```
 
 测试里的假会话故意只实现插件真正用到的几个接口（`surface.nodes` / `snapshotEvents` / `eventAt` / `deriveEventMessage`），
