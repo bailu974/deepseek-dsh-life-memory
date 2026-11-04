@@ -1,5 +1,5 @@
 /**
- * @tuhengyu/dsh-full-life-memory — 仿生终身记忆
+ * dsh-life-memory — 会遗忘的记忆（源自 @tuhengyu/dsh-full-life-memory，MIT）
  *
  * 本文件是 index.ts 去掉类型注解后的运行时版本（DSH Loader 直接加载它）。
  * 逻辑与 index.ts 完全一致，改动时请同步两边。
@@ -15,7 +15,7 @@
  * 的 commitCompactionBody），所以模型下一轮请求里真的看不到那两轮对话了。
  *
  * 运行时：DSH Host（Electron 44 / Node 24），只用内置 node:sqlite，零第三方依赖。
- * @module @tuhengyu/dsh-full-life-memory
+ * @module dsh-life-memory
  */
 
 import { DatabaseSync } from 'node:sqlite'
@@ -382,18 +382,14 @@ export function selectForgettableSpan(session, options, events = session.snapsho
   const removable = Math.max(0, live.length - keep)
   if (removable < 1) return null
 
-  // 一次砍到位：估算每个 turn 的体量（字符/3），累计到「把总量压回阈值以下」为止，
+  // 一次砍到位：估算每个 turn 的体量，累计到「把总量压回阈值以下」为止，
   // 而不是每次只切 forgetTurns 轮。forgetTurns 现在只当单次上限用。
+  // 估算口径必须和 measureTokens 一致，否则「该砍多少」永远是错的。
   const tokensPerTurn = new Map()
   for (const seq of nodes) {
     const turnOfNode = turnMap.get(seq)
     if (turnOfNode === undefined) continue
-    const msg = session.deriveEventMessage?.(session.eventAt(seq))
-    let chars = 0
-    for (const block of msg?.content ?? []) {
-      if (block.type === 'text' && typeof block.text === 'string') chars += block.text.length
-    }
-    // 中文约 0.6 token/字（早先按 chars/3 会低估 1.8 倍，导致永远算不够、把能切的都切光）
+    const chars = textCharsOf(session.deriveEventMessage?.(session.eventAt(seq)))
     tokensPerTurn.set(turnOfNode, (tokensPerTurn.get(turnOfNode) ?? 0) + Math.ceil(chars * 0.6))
   }
 
@@ -441,6 +437,20 @@ export function selectForgettableSpan(session, options, events = session.snapsho
   }
 }
 
+/** 递归统计一条消息里的字符数（工具结果的正文藏在 content / output 里，别漏）。 */
+function textCharsOf(message) {
+  let chars = 0
+  const walk = (blocks) => {
+    for (const block of blocks ?? []) {
+      if (typeof block?.text === 'string') chars += block.text.length
+      if (Array.isArray(block?.content)) walk(block.content)
+      if (Array.isArray(block?.output)) walk(block.output)
+    }
+  }
+  walk(message?.content)
+  return chars
+}
+
 function measureTokens(ctx, session) {
   const meter = ctx.get('tokenMeter')
   if (meter !== undefined && typeof meter.measure === 'function') {
@@ -452,17 +462,8 @@ function measureTokens(ctx, session) {
     }
   }
   let chars = 0
-  const collect = (blocks) => {
-    for (const block of blocks ?? []) {
-      if (typeof block?.text === 'string') chars += block.text.length
-      // 工具结果的正文藏在 content 里，别漏了（漏了会低估整轮体量）
-      if (Array.isArray(block?.content)) collect(block.content)
-      if (Array.isArray(block?.output)) collect(block.output)
-    }
-  }
   for (const seq of session.surface.nodes) {
-    const message = session.deriveEventMessage?.(session.eventAt(seq))
-    collect(message?.content)
+    chars += textCharsOf(session.deriveEventMessage?.(session.eventAt(seq)))
   }
   // 中文约 0.6 token/字（原来按 /3 低估了约 1.8 倍）
   return Math.ceil(chars * 0.6)
@@ -486,13 +487,8 @@ function shadowedTokens(ctx, session, seqs) {
     /* 落回字符估算 */
   }
   let chars = 0
-  for (const seq of seqs) {
-    const message = session.deriveEventMessage?.(session.eventAt(seq))
-    for (const block of message?.content ?? []) {
-      if (block.type === 'text' && typeof block.text === 'string') chars += block.text.length
-    }
-  }
-  return Math.ceil(chars / 3)
+  for (const seq of seqs) chars += textCharsOf(session.deriveEventMessage?.(session.eventAt(seq)))
+  return Math.ceil(chars * 0.6)
 }
 
 /**
@@ -551,12 +547,23 @@ export function resolvePolicy(settings, sessionId) {
 }
 
 export function installForgettingHook(ctx, settings, connection) {
+  // 插件被重复 apply（重载/多 profile）时，只挂一次钩子，否则一次 step 会折两遍。
+  const guardKey = Symbol.for('dsh.life-memory.forget-hook')
+  if (ctx[guardKey] === true) return
+  try {
+    Object.defineProperty(ctx, guardKey, { value: true, enumerable: false, configurable: true })
+  } catch {
+    /* 冻结的 ctx 就跳过这道保护 */
+  }
   // 每个会话各自记「这一轮已经折了几次」。
   // 旧实现是一个模块级 let lastCutTurn —— 两个会话轮次号相同时会互相挡住，
   // 表现为「A 折完，B 到同一轮就再也不折」。这里按 agentId 分开。
   const foldState = new Map() // agentId -> { turn, count }
+  const compactionSeen = new Map() // agentId -> 第一次看到未闭合 start 的时间
   const MAX_FOLD_PER_TURN = 3 // 一轮最多折几次，避免一步一刀把当前轮掏空
   const MAX_SKIP = 3 // 最旧那段不合格时，最多往后退几段再试
+  const MAX_TRACKED_SESSIONS = 200 // 防止 Map 无限长
+  const STALE_COMPACTION_MS = 5 * 60_000
 
   const noticeOf = (state, agentId, turn) => {
     if (state.turn !== turn) {
@@ -574,7 +581,8 @@ export function installForgettingHook(ctx, settings, connection) {
 
       const agentId = String(payload.agent?.id ?? session.id ?? '')
       const state = foldState.get(agentId) ?? { turn: -1, count: 0 }
-      noticeOf(state, agentId, payload.turn)
+      // 某些 step 可能不带 turn；用 -1 兜底，别让计数永远卡在 3 次
+      noticeOf(state, agentId, typeof payload.turn === 'number' ? payload.turn : -1)
       if (state.count >= MAX_FOLD_PER_TURN) return await next()
 
       const policy = resolvePolicy(settings, agentId)
@@ -582,7 +590,19 @@ export function installForgettingHook(ctx, settings, connection) {
       if (tokens < policy.forgetThresholdTokens) return await next()
 
       const events = session.snapshotEvents()
-      if (compactionActive(events)) return await next()
+      // 未闭合的 compaction/start 有两种可能：真在进行，或者崩溃残留。
+      // 真在进行时不该抢 surface；残留下来的会让这个会话永不折叠 —— 用时间兜底。
+      if (compactionActive(events)) {
+        const seenAt = compactionSeen.get(agentId)
+        if (seenAt === undefined) {
+          compactionSeen.set(agentId, Date.now())
+          return await next()
+        }
+        if (Date.now() - seenAt < STALE_COMPACTION_MS) return await next()
+        compactionSeen.delete(agentId) // 超过 5 分钟：当残留，继续往下折
+      } else {
+        compactionSeen.delete(agentId)
+      }
 
       // 最旧那段可能「工具没配对」或者「提不出线索」，那就往后退一段再试，
       // 而不是直接放弃 —— 否则这个会话会永远卡在同一个不合格区间上。
@@ -645,6 +665,11 @@ export function installForgettingHook(ctx, settings, connection) {
 
       state.count += 1
       foldState.set(agentId, state)
+      if (foldState.size > MAX_TRACKED_SESSIONS) {
+        // 删最旧的一条，避免长期运行后 Map 越来越大
+        const oldest = foldState.keys().next().value
+        if (oldest !== undefined && oldest !== agentId) foldState.delete(oldest)
+      }
       ctx.logger?.info?.(
         `life-memory: folded ${span.turns.length} turn(s) (~${tokens} tokens) ` +
         `from surface seq ${span.startSeq}..${span.endSeq} as compaction ${compactionId}; clues: ${clue.keywords.join(', ')}`,
