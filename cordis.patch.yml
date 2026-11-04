@@ -1,0 +1,45 @@
+# ============================================================================
+# dsh-life-memory —— DSH bundle patch（插件自带的挂载声明）
+# ============================================================================
+# 装上之后，profile 只要在 `dsh.profile.bundles` 里列出本包名即生效：
+#
+#   dsh plugin --profile desktop add dsh-life-memory
+#
+# 组成顺序：每个 bundle 的 patch 按 dsh.profile.bundles 顺序叠
+#          → 再叠 profile 自己那一层的 cordis.patch.yml
+# ============================================================================
+
+- insert:
+    - id: life-memory
+      name: dsh-life-memory
+      config:
+        # 线索库位置；留空 = <家>/life-memory/memory.db
+        # dbPath: 'D:/dsh-memory/memory.db'
+
+        # 一次 recall 最多回几条线索、拼多长
+        limit: 5
+        maxPromptChars: 1800
+
+        # 自动遗忘
+        autoForget: true
+        # 会话估算 token 超过这个值就开始遗忘（默认值；下面 qqPolicy 可按会话覆盖）
+        forgetThresholdTokens: 20000
+        # 单次最多切几轮；200 = 一次砍到位，只受 keepCompletedTurns 约束
+        forgetTurns: 200
+        # 最近这么多轮永远保留
+        keepCompletedTurns: 5
+
+        # 按会话分策略：QQ 聊天会话激进（一次砍到阈值、只留 5 轮），
+        # 桌面会话温和（阈值更高、保留更多，别把缓存冲太勤）。
+        # qqSessionsFile 指向一份能认出「哪些 session 是 QQ 会话」的 JSON（例如 qq-bridge 的 sessions.json）。
+        # 不配就整体用上面的默认值。
+        # qqSessionsFile: 'E:/ai/qq-bridge/state/sessions.json'
+        # qqPolicy:
+        #   aggressive:
+        #     forgetThresholdTokens: 20000
+        #     forgetTurns: 200
+        #     keepCompletedTurns: 5
+        #   gentle:
+        #     forgetThresholdTokens: 60000
+        #     forgetTurns: 10
+        #     keepCompletedTurns: 20
