@@ -144,3 +144,13 @@ MIT。
 
 思路与原始实现来自 [`@tuhengyu/dsh-full-life-memory`](https://www.npmjs.com/package/@tuhengyu/dsh-full-life-memory)（作者 tuhengyu，MIT）。
 本仓库在其基础上修了上面列的 5 个问题，并补了测试。
+
+---
+
+## 版本
+
+| 版本 | 状态 | 说明 |
+|---|---|---|
+| **v1.2.0** | 当前 | 修掉跨会话干扰、一轮只折一次、不合格不重试、失败不补偿、陈旧 compaction；估算口径统一 |
+| v1.1.0 | 作废 | 只修了跨会话那一批，估算与守卫不完整，别用 |
+| v1.0 | 作废 | 初版 |
