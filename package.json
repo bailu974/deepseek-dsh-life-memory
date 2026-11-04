@@ -1,0 +1,50 @@
+{
+  "name": "dsh-life-memory",
+  "version": "0.1.0",
+  "description": "DSH 插件：会遗忘的记忆。上下文放不下时把旧轮次蒸馏成关键词线索、从历史切除，需要时用 recall_from_clues 顺着线索回想。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "forget",
+    "recall",
+    "compaction"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "icon.svg",
+    "cordis.patch.yml",
+    "locale",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bailu974/deepseek-dsh-life-memory.git"
+  },
+  "homepage": "https://github.com/bailu974/deepseek-dsh-life-memory#readme",
+  "bugs": {
+    "url": "https://github.com/bailu974/deepseek-dsh-life-memory/issues"
+  }
+}
