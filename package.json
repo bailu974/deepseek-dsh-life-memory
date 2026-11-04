@@ -1,6 +1,6 @@
 {
   "name": "dsh-life-memory",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH 插件：会遗忘的记忆。上下文放不下时把旧轮次蒸馏成关键词线索、从历史切除，需要时用 recall_from_clues 顺着线索回想。",
   "keywords": [
     "dsh",
