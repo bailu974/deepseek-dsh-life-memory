@@ -156,3 +156,26 @@ test('最旧那段工具没闭合时，会往后退一段继续折（不是直�
   assert.ok(a.surface.nodes.length < before, '应该跳过第 1 段、折后面的');
   db.close();
 });
+
+test('折叠提示本身不会被当成素材再折一次', async () => {
+  const db = makeDb();
+  const ctx = makeCtx();
+  installForgettingHook(ctx, settings, () => db);
+
+  const s = makeSession({ id: 'session-notice', turns: 8 });
+  // 在最旧的几轮里塞一条「记忆已折叠」提示，模拟上一次折叠留下的 checkpoint
+  const events = s.snapshotEvents();
+  const noticeSeq = 2;
+  events.push({ seq: 9001, type: 'user/message', data: { message: { content: [{ type: 'text', text: '【🧠 记忆已折叠】为了腾出空间，我已淡忘更早的 2 轮对话，留下的线索：旧线索。' }] } } });
+  s.surface.nodes.unshift(9001);
+
+  await ctx.run({ id: 'session-notice', session: s }, 7);
+
+  const rows = db.prepare('SELECT keywords, seed_tokens FROM memory_clues').all();
+  assert.ok(rows.length > 0, '应该折了一次');
+  for (const r of rows) {
+    const text = String(r.keywords) + ' ' + String(r.seed_tokens);
+    assert.ok(!text.includes('记忆已折叠'), '线索里不该出现折叠提示：' + text.slice(0, 80));
+  }
+  db.close();
+});
