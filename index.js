@@ -617,7 +617,11 @@ export function installForgettingHook(ctx, settings, connection) {
         if (candidate === null) continue
         const texts = []
         for (const seq of candidate.shadowedSeqs) {
-          texts.push(messageText(session.deriveEventMessage?.(session.eventAt(seq))))
+          const text = messageText(session.deriveEventMessage?.(session.eventAt(seq)))
+          // 别把「记忆已折叠」提示本身当成素材：它会被折成新线索，
+          // 下次召回就变成一串自己引用自己 —— 实测库里有一半是这样的空线索。
+          if (text.trim().startsWith('【🧠 记忆已折叠】')) continue
+          texts.push(text)
         }
         const parsed = extractClue(texts.filter((text) => text.trim() !== ''))
         if (parsed.seedTokens.length === 0) continue
